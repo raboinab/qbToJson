@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sample files (not needed in production)
+sampleReports/
+sampleJson/
+
+# Documentation
+README.md
+CONVERTER_SUMMARY.md
+RENAMING_COMPLETE.md
+*.md
+
+# Git
+.git/
+.gitignore
+
+# Testing
+test_*.json
+*.test.py
