@@ -106,6 +106,33 @@ class TrialBalanceConverter:
         # Default fallback
         return "JAN", "2025", date(2025, 1, 1), date(2025, 1, 31)
     
+    def extract_date_from_as_of(self, text: str) -> Tuple[str, str, date, date]:
+        """Extract date from 'As of [Date]' format"""
+        # Match patterns like "As of May 31, 2024" or "As of May 30, 2025"
+        match = re.search(r'As of\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', text, re.IGNORECASE)
+        if match:
+            month_name = match.group(1)
+            year = match.group(3)
+            
+            # Convert month name to number
+            try:
+                month_num = datetime.strptime(month_name, '%B').month
+            except ValueError:
+                try:
+                    month_num = datetime.strptime(month_name[:3], '%b').month
+                except ValueError:
+                    month_num = 1
+            
+            # Create start and end dates for the month
+            start_date = date(int(year), month_num, 1)
+            last_day = calendar.monthrange(int(year), month_num)[1]
+            end_date = date(int(year), month_num, last_day)
+            
+            return month_name.upper()[:3], year, start_date, end_date
+        
+        # Fallback
+        return "JAN", "2025", date(2025, 1, 1), date(2025, 1, 31)
+    
     def create_row_object(self, account_name: str, debit: str = "", credit: str = "", 
                          account_id: Optional[str] = None, is_total: bool = False) -> Dict[str, Any]:
         """Create a row object for the trial balance"""
@@ -415,11 +442,138 @@ class TrialBalanceConverter:
         
         return data_by_month
     
+    def parse_single_month_pdf(self, filepath: Path) -> Dict[str, Dict[str, Any]]:
+        """Parse single-month PDF format (e.g., 'As of May 31, 2024')"""
+        if not PDF_SUPPORT:
+            raise ImportError("pdfplumber is required for PDF support")
+        
+        data_by_month = {}
+        
+        with pdfplumber.open(filepath) as pdf:
+            # Extract text from all pages
+            full_text = ""
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n"
+            
+            if not full_text:
+                return data_by_month
+            
+            # Extract date from "As of [Date]" format
+            month, year, start_date, end_date = self.extract_date_from_as_of(full_text)
+            month_key = f"{year}-{month}"
+            
+            # Initialize month data
+            data_by_month[month_key] = {
+                'month': month,
+                'year': year,
+                'start_date': start_date,
+                'end_date': end_date,
+                'accounts': [],
+                'total_debit': 0.0,
+                'total_credit': 0.0
+            }
+            
+            lines = full_text.split('\n')
+            
+            # Find DEBIT/CREDIT header line
+            header_idx = -1
+            for i, line in enumerate(lines):
+                if 'DEBIT' in line.upper() and 'CREDIT' in line.upper():
+                    header_idx = i
+                    break
+            
+            if header_idx == -1:
+                print(f"[DEBUG] Could not find DEBIT/CREDIT header in PDF", file=sys.stderr)
+                return data_by_month
+            
+            # Parse account lines (after header, before TOTAL)
+            for line_idx in range(header_idx + 1, len(lines)):
+                line = lines[line_idx].strip()
+                
+                # Stop at TOTAL line
+                if not line or line.upper().startswith('TOTAL'):
+                    break
+                
+                # Skip page headers that repeat
+                if any(skip in line.upper() for skip in ['TRIAL BALANCE', 'AS OF', 'ACCRUAL BASIS', 'DEBIT', 'CREDIT']):
+                    continue
+                
+                # Extract account name and values using regex
+                # Pattern: account name followed by numbers
+                # Account names can contain letters, spaces, parentheses, slashes, colons, etc.
+                match = re.match(r'^(.+?)\s+([\d,]+\.?\d*)\s*([\d,]+\.?\d*)?$', line)
+                
+                if match:
+                    account_name = match.group(1).strip()
+                    
+                    # Skip if it looks like a page number or date
+                    if account_name.isdigit() or re.match(r'^\d+/\d+$', account_name):
+                        continue
+                    
+                    # Parse debit value
+                    debit_str = match.group(2).strip().replace(',', '')
+                    try:
+                        debit_value = float(debit_str)
+                    except ValueError:
+                        debit_value = 0.0
+                    
+                    # Parse credit value (might be empty)
+                    credit_value = 0.0
+                    if match.group(3):
+                        credit_str = match.group(3).strip().replace(',', '')
+                        try:
+                            credit_value = float(credit_str)
+                        except ValueError:
+                            credit_value = 0.0
+                    
+                    # Determine if value is debit or credit based on account type
+                    # If only one value present, infer from account name
+                    if debit_value > 0 and credit_value == 0:
+                        # Check if this is likely a credit account
+                        if any(keyword in account_name.upper() for keyword in 
+                               ['PAYABLE', 'EQUITY', 'EARNINGS', 'LOAN', 'RETAINED', 'CONTRIBUTIONS', 'REVENUE', 'INCOME', 'SALES', 'SERVICES']):
+                            credit_value = debit_value
+                            debit_value = 0.0
+                    
+                    # Get account ID
+                    account_id = self.get_or_create_account_id(account_name)
+                    
+                    # Add account
+                    if debit_value != 0 or credit_value != 0:
+                        data_by_month[month_key]['accounts'].append({
+                            'name': account_name,
+                            'id': account_id,
+                            'debit': debit_value,
+                            'credit': credit_value
+                        })
+                        data_by_month[month_key]['total_debit'] += debit_value
+                        data_by_month[month_key]['total_credit'] += credit_value
+        
+        return data_by_month
+    
     def parse_pdf_data(self, filepath: Path) -> Dict[str, Dict[str, Any]]:
         """Parse PDF file and extract trial balance data by month"""
         if not PDF_SUPPORT:
             raise ImportError("pdfplumber is required for PDF support. Install with: pip install pdfplumber")
         
+        # First, detect format
+        with pdfplumber.open(filepath) as pdf:
+            first_page_text = pdf.pages[0].extract_text() if pdf.pages else ""
+            
+            # Check if it's single-month format
+            if "As of" in first_page_text and "DEBIT" in first_page_text.upper() and "CREDIT" in first_page_text.upper():
+                # Check if it's NOT multi-month (no multiple month names with years)
+                month_year_pattern = r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4}'
+                month_matches = re.findall(month_year_pattern, first_page_text.upper())
+                
+                if len(month_matches) < 2:  # Single month or no months found
+                    print(f"[DEBUG] Detected single-month PDF format", file=sys.stderr)
+                    return self.parse_single_month_pdf(filepath)
+        
+        # Fall back to multi-month parser
+        print(f"[DEBUG] Using multi-month PDF parser", file=sys.stderr)
         data_by_month = {}
         
         with pdfplumber.open(filepath) as pdf:
