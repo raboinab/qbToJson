@@ -275,11 +275,195 @@ class TrialBalanceConverter:
         
         return data_by_month
     
+    def parse_single_month_xlsx(self, filepath: Path) -> Dict[str, Dict[str, Any]]:
+        """Parse single-month XLSX format (e.g., 'As of December 31, 2025')"""
+        if not XLSX_SUPPORT:
+            raise ImportError("openpyxl is required for XLSX support")
+        
+        # Save and reload with data_only to force formula evaluation
+        import tempfile
+        temp_file = tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        try:
+            # Load and immediately save to evaluate formulas
+            wb = openpyxl.load_workbook(filepath)
+            wb.save(temp_path)
+            wb.close()
+            
+            # Now load with data_only=True to get evaluated values
+            workbook = openpyxl.load_workbook(temp_path, data_only=True)
+            sheet = workbook.active
+            
+            data_by_month = {}
+            
+            # Convert to list of lists
+            rows = []
+            for row in sheet.iter_rows(values_only=True):
+                rows.append([cell if cell is not None else '' for cell in row])
+        finally:
+            # Clean up temp file
+            import os
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+        
+        if len(rows) < 5:
+            print(f"[DEBUG] XLSX has too few rows: {len(rows)}", file=sys.stderr)
+            return data_by_month
+        
+        # Find "As of [Date]" in early rows (typically row 2 or 3)
+        date_text = ""
+        for i in range(min(5, len(rows))):
+            row_text = ' '.join(str(cell) for cell in rows[i] if cell)
+            if "As of" in row_text:
+                date_text = row_text
+                break
+        
+        if not date_text:
+            print(f"[DEBUG] Could not find 'As of' date in XLSX", file=sys.stderr)
+            return data_by_month
+        
+        # Extract date from header
+        month, year, start_date, end_date = self.extract_date_from_as_of(date_text)
+        month_key = f"{year}-{month}"
+        
+        # Initialize month data
+        data_by_month[month_key] = {
+            'month': month,
+            'year': year,
+            'start_date': start_date,
+            'end_date': end_date,
+            'accounts': [],
+            'total_debit': 0.0,
+            'total_credit': 0.0
+        }
+        
+        # Find DEBIT/CREDIT header row
+        header_idx = -1
+        debit_col = -1
+        credit_col = -1
+        
+        for i in range(min(10, len(rows))):
+            for j, cell in enumerate(rows[i]):
+                cell_str = str(cell).upper()
+                if 'DEBIT' in cell_str:
+                    header_idx = i
+                    debit_col = j
+                if 'CREDIT' in cell_str:
+                    credit_col = j
+            if header_idx != -1 and debit_col != -1 and credit_col != -1:
+                break
+        
+        if header_idx == -1:
+            print(f"[DEBUG] Could not find DEBIT/CREDIT headers in XLSX", file=sys.stderr)
+            return data_by_month
+        
+        print(f"[DEBUG] Found headers at row {header_idx}, debit col {debit_col}, credit col {credit_col}", file=sys.stderr)
+        
+        # Parse account data (after header, before TOTAL)
+        for row_idx in range(header_idx + 1, len(rows)):
+            row = rows[row_idx]
+            
+            if not row or len(row) < 2:
+                continue
+            
+            # First column should be account name
+            account_name = str(row[0]).strip()
+            
+            # Stop at TOTAL line
+            if account_name.upper() in ['TOTAL', 'TOTALS']:
+                break
+            
+            # Skip empty account names
+            if not account_name or account_name == '' or account_name == 'None':
+                continue
+            
+            # Skip footer lines (date stamps, etc.)
+            if any(skip in account_name.lower() for skip in ['accrual basis', 'gmt', 'pm', 'am']):
+                continue
+            
+            # Get debit value
+            debit_value = 0.0
+            if debit_col < len(row):
+                debit_cell = row[debit_col]
+                if debit_cell and debit_cell != '':
+                    try:
+                        debit_value = float(str(debit_cell).replace(',', ''))
+                    except (ValueError, AttributeError):
+                        debit_value = 0.0
+            
+            # Get credit value
+            credit_value = 0.0
+            if credit_col < len(row):
+                credit_cell = row[credit_col]
+                if credit_cell and credit_cell != '':
+                    try:
+                        credit_value = float(str(credit_cell).replace(',', ''))
+                    except (ValueError, AttributeError):
+                        credit_value = 0.0
+            
+            # Get account ID
+            account_id = self.get_or_create_account_id(account_name)
+            
+            # Add account if it has any value
+            if debit_value != 0 or credit_value != 0:
+                data_by_month[month_key]['accounts'].append({
+                    'name': account_name,
+                    'id': account_id,
+                    'debit': debit_value,
+                    'credit': credit_value
+                })
+                data_by_month[month_key]['total_debit'] += debit_value
+                data_by_month[month_key]['total_credit'] += credit_value
+        
+        return data_by_month
+    
     def parse_xlsx_data(self, filepath: Path) -> Dict[str, Dict[str, Any]]:
         """Parse XLSX file and extract trial balance data by month"""
         if not XLSX_SUPPORT:
             raise ImportError("openpyxl is required for XLSX support. Install with: pip install openpyxl")
         
+        # First, detect format by reading with data_only=True to evaluate formulas
+        workbook = openpyxl.load_workbook(filepath, data_only=True)
+        sheet = workbook.active
+        
+        # Convert first few rows to check format
+        rows = []
+        row_count = 0
+        for row in sheet.iter_rows(values_only=True):
+            rows.append([cell if cell is not None else '' for cell in row])
+            row_count += 1
+            if row_count >= 10:  # Only need first 10 rows for detection
+                break
+        
+        # Check if it's single-month format
+        has_as_of = False
+        for i in range(min(5, len(rows))):
+            row_text = ' '.join(str(cell) for cell in rows[i] if cell)
+            if "As of" in row_text:
+                has_as_of = True
+                break
+        
+        # Count month columns with years in remaining rows
+        month_year_count = 0
+        for i in range(5, len(rows)):
+            row_text = ' '.join(str(cell) for cell in rows[i] if cell)
+            for month in ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER']:
+                if re.search(rf'{month}\s+\d{{4}}', row_text.upper()):
+                    month_year_count += 1
+                    break
+        
+        if has_as_of and month_year_count < 2:
+            print(f"[DEBUG] Detected single-month XLSX format", file=sys.stderr)
+            return self.parse_single_month_xlsx(filepath)
+        
+        # Fall back to multi-month parser
+        print(f"[DEBUG] Using multi-month XLSX parser", file=sys.stderr)
+        
+        # Re-load workbook without data_only for multi-month parsing
         workbook = openpyxl.load_workbook(filepath)
         sheet = workbook.active
         
@@ -302,8 +486,7 @@ class TrialBalanceConverter:
                 for month in ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER', 'JAN', 'FEB', 'MAR', 'APR', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']:
                     if month in row_text.upper():
                         # Check if it's followed by a year (to confirm it's a month header)
-                        import re
-                        if re.search(f'{month}\\s+\\d{{4}}', row_text.upper()):
+                        if re.search(rf'{month}\s+\d{{4}}', row_text.upper()):
                             month_count += 1
                 
                 # If we found at least 2 months with years, this is likely our header row
@@ -389,7 +572,6 @@ class TrialBalanceConverter:
                         # For now, try to extract numeric value if it's a simple formula
                         if '=' in debit_str and any(c.isdigit() for c in debit_str):
                             # Extract numbers from formula
-                            import re
                             numbers = re.findall(r'[\d.]+', debit_str)
                             if numbers:
                                 try:
@@ -414,7 +596,6 @@ class TrialBalanceConverter:
                         # For now, try to extract numeric value if it's a simple formula
                         if '=' in credit_str and any(c.isdigit() for c in credit_str):
                             # Extract numbers from formula
-                            import re
                             numbers = re.findall(r'[\d.]+', credit_str)
                             if numbers:
                                 try:
