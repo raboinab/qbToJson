@@ -280,35 +280,35 @@ class TrialBalanceConverter:
         if not XLSX_SUPPORT:
             raise ImportError("openpyxl is required for XLSX support")
         
-        # Save and reload with data_only to force formula evaluation
-        import tempfile
-        temp_file = tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False)
-        temp_path = temp_file.name
-        temp_file.close()
+        # Load without data_only to get formulas, then extract values
+        workbook = openpyxl.load_workbook(filepath, data_only=False)
+        sheet = workbook.active
         
-        try:
-            # Load and immediately save to evaluate formulas
-            wb = openpyxl.load_workbook(filepath)
-            wb.save(temp_path)
-            wb.close()
-            
-            # Now load with data_only=True to get evaluated values
-            workbook = openpyxl.load_workbook(temp_path, data_only=True)
-            sheet = workbook.active
-            
-            data_by_month = {}
-            
-            # Convert to list of lists
-            rows = []
-            for row in sheet.iter_rows(values_only=True):
-                rows.append([cell if cell is not None else '' for cell in row])
-        finally:
-            # Clean up temp file
-            import os
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
+        data_by_month = {}
+        
+        # Convert to list of lists and extract values from formulas
+        rows = []
+        for row in sheet.iter_rows(values_only=True):
+            row_data = []
+            for cell in row:
+                if cell is None or cell == '':
+                    row_data.append('')
+                else:
+                    cell_str = str(cell)
+                    # Check if it's an Excel formula (e.g., '=1201.00')
+                    if cell_str.startswith('='):
+                        # Extract number from formula
+                        match = re.search(r'=([\d.]+)', cell_str)
+                        if match:
+                            try:
+                                row_data.append(float(match.group(1)))
+                            except ValueError:
+                                row_data.append(cell)
+                        else:
+                            row_data.append(cell)
+                    else:
+                        row_data.append(cell)
+            rows.append(row_data)
         
         if len(rows) < 5:
             print(f"[DEBUG] XLSX has too few rows: {len(rows)}", file=sys.stderr)
