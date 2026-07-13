@@ -110,10 +110,26 @@ class AccountsConverter(BaseConverter):
         t = (type_str or '').strip().lower()
         return bool(t) and any(tok in t for tok in self.ACCOUNT_TYPE_TOKENS)
 
+    @staticmethod
+    def _col(row: Dict[str, Any], *candidates: str) -> str:
+        """Case-insensitively fetch a column value by trying candidate header names.
+
+        QuickBooks exports the Account List with 'Full name'/'Type', while QBO's
+        chart-of-accounts export uses 'Account name'/'Account type'. Matching on
+        normalized header names keeps both layouts working.
+        """
+        norm = {str(k).strip().lower(): v for k, v in row.items() if k is not None}
+        for cand in candidates:
+            val = norm.get(cand.strip().lower())
+            if val not in (None, ''):
+                return str(val).strip()
+        return ''
+
     def create_account_object(self, name: str, type_str: str, detail_type: str,
                               description: Optional[str] = None,
                               balance: float = 0.0,
-                              parent_id: Optional[str] = None) -> Dict[str, Any]:
+                              parent_id: Optional[str] = None,
+                              acct_num: Optional[str] = None) -> Dict[str, Any]:
         """Create a QuickBooks-style account object"""
         classification = self.get_classification_from_type(type_str)
         account_type = self.get_account_type_from_type(type_str)
@@ -164,7 +180,7 @@ class AccountsConverter(BaseConverter):
             "accountType": account_type,
             "accountSubType": account_subtype,
             "accountPurposes": [],
-            "acctNum": None,
+            "acctNum": (acct_num.strip() or None) if acct_num else None,
             "acctNumExtn": None,
             "bankNum": None,
             "openingBalance": None,
@@ -221,15 +237,14 @@ class AccountsConverter(BaseConverter):
         for row in reader:
             row_count += 1
 
-            full_name = (row.get('Full name') or row.get('Name') or
-                         row.get('FULL NAME') or row.get('NAME') or '').strip()
+            # 'Full name' = QB Account List; 'Account name' = QBO chart-of-accounts export
+            full_name = self._col(row, 'Full name', 'Account name', 'Name')
 
             if not full_name:
                 skipped_count += 1
                 continue
 
-            type_str = (row.get('Type') or row.get('TYPE') or
-                        row.get('Account Type') or '').strip()
+            type_str = self._col(row, 'Type', 'Account type', 'Account Type')
 
             # Keep only real accounts (identified by a recognised Type). Report
             # decoration -- the TOTAL row and the "Accrual Basis ... GMTZ" footer --
@@ -238,12 +253,11 @@ class AccountsConverter(BaseConverter):
                 skipped_count += 1
                 continue
 
-            detail_type = (row.get('Detail type') or row.get('Detail Type') or
-                           row.get('DETAIL TYPE') or row.get('Sub Type') or '').strip()
-            description = (row.get('Description') or row.get('DESCRIPTION') or '').strip()
+            detail_type = self._col(row, 'Detail type', 'Detail Type', 'Sub Type')
+            description = self._col(row, 'Description')
+            acct_num = self._col(row, 'Account number', 'Account #', 'Acct #', 'Number')
 
-            balance_str = (row.get('Total balance') or row.get('Balance') or
-                           row.get('TOTAL BALANCE') or row.get('Current Balance') or '0')
+            balance_str = self._col(row, 'Total balance', 'Balance', 'Current Balance') or '0'
             balance_str = str(balance_str).replace('$', '').replace(',', '').strip()
             try:
                 balance = float(balance_str) if balance_str else 0.0
@@ -262,7 +276,8 @@ class AccountsConverter(BaseConverter):
                 detail_type=detail_type or 'Other',
                 description=description,
                 balance=balance,
-                parent_id=parent_id
+                parent_id=parent_id,
+                acct_num=acct_num
             )
             accounts.append(account)
 
@@ -284,7 +299,8 @@ class AccountsConverter(BaseConverter):
 
         header_row = None
         for idx, row in enumerate(sheet.iter_rows(values_only=True), 1):
-            if row and 'Full name' in str(row):
+            row_l = str(row).lower()
+            if row and ('full name' in row_l or 'account name' in row_l):
                 header_row = idx
                 break
 
@@ -292,21 +308,32 @@ class AccountsConverter(BaseConverter):
             raise ValueError("Could not find header row in XLSX file")
 
         headers = list(sheet.iter_rows(min_row=header_row, max_row=header_row, values_only=True))[0]
-        col_map = {header: idx for idx, header in enumerate(headers) if header}
+        # Normalize header names so both QB Account List ('Full name'/'Type') and
+        # QBO chart-of-accounts ('Account name'/'Account type') layouts map cleanly
+        col_map = {str(h).strip().lower(): idx for idx, h in enumerate(headers) if h}
+
+        def cell(row, *names, default=''):
+            for n in names:
+                idx = col_map.get(n.strip().lower())
+                if idx is not None and idx < len(row) and row[idx] not in (None, ''):
+                    return str(row[idx]).strip()
+            return default
+
+        name_idx = col_map.get('full name', col_map.get('account name', col_map.get('name', 0)))
 
         for row in sheet.iter_rows(min_row=header_row + 1, values_only=True):
-            if not row or not row[col_map.get('Full name', 0)]:
+            if not row or name_idx >= len(row) or not row[name_idx]:
                 continue
 
-            name = str(row[col_map.get('Full name', 0)])
-            type_str = str(row[col_map.get('Type', 1)] or '').strip()
+            name = str(row[name_idx]).strip()
+            type_str = cell(row, 'Type', 'Account type')
 
             # Keep only real accounts (recognised Type); the TOTAL row and the
             # "Accrual Basis ... GMTZ" footer have no Type and are skipped.
             if not self.is_known_account_type(type_str):
                 continue
 
-            balance_str = str(row[col_map.get('Total balance', 4)] or '0')
+            balance_str = cell(row, 'Total balance', 'Balance', 'Current Balance', default='0')
             balance_str = balance_str.replace('$', '').replace(',', '')
             try:
                 balance = float(balance_str) if balance_str else 0.0
@@ -322,10 +349,11 @@ class AccountsConverter(BaseConverter):
             account = self.create_account_object(
                 name=name,
                 type_str=type_str,
-                detail_type=row[col_map.get('Detail type', 2)] or '',
-                description=row[col_map.get('Description', 3)],
+                detail_type=cell(row, 'Detail type', 'Detail Type', 'Sub Type'),
+                description=cell(row, 'Description') or None,
                 balance=balance,
-                parent_id=parent_id
+                parent_id=parent_id,
+                acct_num=cell(row, 'Account number', 'Account #', 'Acct #', 'Number')
             )
             accounts.append(account)
             parent_ids[name] = account['id']
