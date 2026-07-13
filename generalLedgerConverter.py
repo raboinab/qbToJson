@@ -208,8 +208,30 @@ class GeneralLedgerConverter(BaseConverter):
                 except ValueError as e:
                     print(f"⚠️  Date parsing error (Pattern 2): {e}", file=sys.stderr)
 
+        # Pattern 2b: "January-December, 2025" or "Jan - Dec 2025" (month range, no day numbers)
+        # Infers start = 1st of start month, end = last day of end month
+        match = re.search(r'([A-Za-z]{3,})\s*[-–—]\s*([A-Za-z]{3,}),?\s*(\d{4})', header_text)
+        if match:
+            start_month_name = match.group(1)
+            end_month_name = match.group(2)
+            year = int(match.group(3))
+
+            start_month_num = months_full.get(start_month_name.capitalize()) or months_abbr.get(start_month_name.capitalize())
+            end_month_num = months_full.get(end_month_name.capitalize()) or months_abbr.get(end_month_name.capitalize())
+
+            if start_month_num and end_month_num:
+                try:
+                    start_date = date(year, start_month_num, 1)
+                    last_day = calendar.monthrange(year, end_month_num)[1]
+                    end_date = date(year, end_month_num, last_day)
+                    period = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                    print(f"📅 Parsed header date (Pattern 2b - month range): {period}", file=sys.stderr)
+                    return period, start_date, end_date
+                except ValueError as e:
+                    print(f"⚠️  Date parsing error (Pattern 2b): {e}", file=sys.stderr)
+
         # Pattern 3: "01/01/2024 - 01/31/2024" or "1/1/2024 to 12/31/2024" (numeric dates)
-        match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})\s*[-–—to]+\s*(\d{1,2})/(\d{1,2})/(\d{4})', header_text, re.IGNORECASE)
+        match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})\s*(?:to|through|thru|[-–—])\s*(\d{1,2})/(\d{1,2})/(\d{4})', header_text, re.IGNORECASE)
         if match:
             try:
                 start_date = date(int(match.group(3)), int(match.group(1)), int(match.group(2)))
@@ -238,8 +260,8 @@ class GeneralLedgerConverter(BaseConverter):
                 except ValueError as e:
                     print(f"⚠️  Date parsing error (Pattern 4): {e}", file=sys.stderr)
 
-        # Pattern 5: "2024-01-01 to 2024-01-31" (ISO format)
-        match = re.search(r'(\d{4})-(\d{2})-(\d{2})\s+to\s+(\d{4})-(\d{2})-(\d{2})', header_text, re.IGNORECASE)
+        # Pattern 5: "2024-01-01 to 2024-01-31" or "2024-01-01 - 2024-01-31" (ISO format)
+        match = re.search(r'(\d{4})-(\d{2})-(\d{2})\s*(?:to|through|thru|[-–—])\s*(\d{4})-(\d{2})-(\d{2})', header_text, re.IGNORECASE)
         if match:
             try:
                 start_date = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -486,6 +508,65 @@ class GeneralLedgerConverter(BaseConverter):
 
         return section
 
+    def build_gl_column_map(self, header_row: List[Any]) -> Dict[str, int]:
+        """Map GL transaction fields to their column indices from the header row.
+
+        QuickBooks GL exports may or may not include a leading 'Distribution
+        account' column, which shifts every subsequent data column by one.
+        Detecting indices from the header labels keeps parsing correct for both
+        layouts instead of assuming fixed positions.
+
+        Returns a dict like {'date': 2, 'type': 3, ..., 'balance': 9}.
+        The 'Distribution account' column (redundant with the section headers)
+        is intentionally not mapped.
+        """
+        mapping: Dict[str, int] = {}
+        for idx, cell in enumerate(header_row):
+            label = str(cell if cell is not None else '').strip().lower()
+            if not label:
+                continue
+            if 'date' in label:
+                field = 'date'
+            elif 'type' in label:
+                field = 'type'
+            elif label.startswith('num') or label == '#':
+                field = 'num'
+            elif 'memo' in label or 'description' in label:
+                field = 'memo'
+            elif 'split' in label:
+                field = 'split_account'
+            elif 'amount' in label:
+                field = 'amount'
+            elif 'balance' in label:
+                field = 'balance'
+            elif 'name' in label:
+                field = 'name'
+            else:
+                # 'Distribution account' and any unrecognized columns are ignored
+                continue
+            mapping.setdefault(field, idx)
+        return mapping
+
+    def extract_gl_transaction(self, row: List[Any], colmap: Dict[str, int]) -> Dict[str, str]:
+        """Build a transaction dict from a row using the detected column map."""
+        def get(field: str) -> str:
+            idx = colmap.get(field)
+            if idx is None or idx >= len(row):
+                return ''
+            val = row[idx]
+            return str(val).strip() if val is not None else ''
+
+        return {
+            'date': get('date'),
+            'type': get('type'),
+            'num': get('num'),
+            'name': get('name'),
+            'memo': get('memo'),
+            'split_account': get('split_account'),
+            'amount': get('amount'),
+            'balance': get('balance'),
+        }
+
     def parse_csv(self, filepath: Path) -> Dict[str, Any]:
         """Parse CSV file and extract general ledger data"""
         accounts_data = {}
@@ -522,6 +603,11 @@ class GeneralLedgerConverter(BaseConverter):
 
             if header_row_idx == -1:
                 raise ValueError("Could not find transaction header row")
+
+            # Detect column positions from the header row (handles the optional
+            # leading 'Distribution account' column that shifts every data column)
+            colmap = self.build_gl_column_map(rows[header_row_idx])
+            amount_col = colmap.get('amount', 7)
 
             # Parse data rows
             current_account = None
@@ -562,9 +648,9 @@ class GeneralLedgerConverter(BaseConverter):
 
                 # Check if this is a total row for current account
                 if current_account and first_cell.startswith(f"Total for {current_account}"):
-                    # Extract total from the amount column (usually column 6)
-                    if len(row) > 6:
-                        total_str = str(row[6]).strip().replace(',', '').replace('$', '')
+                    # Extract total from the detected amount column
+                    if len(row) > amount_col:
+                        total_str = str(row[amount_col]).strip().replace(',', '').replace('$', '')
                         if total_str:
                             try:
                                 current_total = float(total_str)
@@ -572,20 +658,19 @@ class GeneralLedgerConverter(BaseConverter):
                                 pass
                     continue
 
+                # Beginning Balance row (opening balance, no transaction date)
+                if current_account and 'beginning balance' in ' '.join(str(c) for c in row).lower():
+                    bal_idx = colmap.get('balance')
+                    balance = str(row[bal_idx]).strip() if (bal_idx is not None and bal_idx < len(row)) else ''
+                    current_transactions.append({
+                        'date': '', 'type': 'Beginning Balance', 'num': '', 'name': '',
+                        'memo': '', 'split_account': '', 'amount': '', 'balance': balance
+                    })
+                    continue
+
                 # This should be a transaction row
                 if current_account and len(row) >= 8:
-                    # Parse transaction data
-                    # Expected columns: Date, Type, Num, Name, Memo, Split, Amount, Balance
-                    transaction = {
-                        'date': str(row[1]).strip() if len(row) > 1 else '',
-                        'type': str(row[2]).strip() if len(row) > 2 else '',
-                        'num': str(row[3]).strip() if len(row) > 3 else '',
-                        'name': str(row[4]).strip() if len(row) > 4 else '',
-                        'memo': str(row[5]).strip() if len(row) > 5 else '',
-                        'split_account': str(row[6]).strip() if len(row) > 6 else '',
-                        'amount': str(row[7]).strip() if len(row) > 7 else '',
-                        'balance': str(row[8]).strip() if len(row) > 8 else ''
-                    }
+                    transaction = self.extract_gl_transaction(row, colmap)
 
                     # Only add if it's a valid transaction (has at least a date)
                     if transaction['date']:
@@ -637,6 +722,11 @@ class GeneralLedgerConverter(BaseConverter):
         if header_row_idx == -1:
             raise ValueError("Could not find transaction header row")
 
+        # Detect column positions from the header row (handles the optional
+        # leading 'Distribution account' column that shifts every data column)
+        colmap = self.build_gl_column_map(rows[header_row_idx])
+        amount_col = colmap.get('amount', 7)
+
         # Process data similar to CSV
         accounts_data = {}
         current_account = None
@@ -678,8 +768,8 @@ class GeneralLedgerConverter(BaseConverter):
 
             # Check if this is a total row
             if current_account and first_cell.startswith(f"Total for {current_account}"):
-                if len(row) > 6:
-                    total_str = row[6].strip().replace(',', '').replace('$', '')
+                if len(row) > amount_col:
+                    total_str = row[amount_col].strip().replace(',', '').replace('$', '')
                     if total_str:
                         try:
                             current_total = float(total_str)
@@ -687,18 +777,19 @@ class GeneralLedgerConverter(BaseConverter):
                             pass
                 continue
 
+            # Beginning Balance row (opening balance, no transaction date)
+            if current_account and 'beginning balance' in ' '.join(row).lower():
+                bal_idx = colmap.get('balance')
+                balance = row[bal_idx].strip() if (bal_idx is not None and bal_idx < len(row)) else ''
+                current_transactions.append({
+                    'date': '', 'type': 'Beginning Balance', 'num': '', 'name': '',
+                    'memo': '', 'split_account': '', 'amount': '', 'balance': balance
+                })
+                continue
+
             # Transaction row
             if current_account and len(row) >= 8:
-                transaction = {
-                    'date': row[1].strip() if len(row) > 1 else '',
-                    'type': row[2].strip() if len(row) > 2 else '',
-                    'num': row[3].strip() if len(row) > 3 else '',
-                    'name': row[4].strip() if len(row) > 4 else '',
-                    'memo': row[5].strip() if len(row) > 5 else '',
-                    'split_account': row[6].strip() if len(row) > 6 else '',
-                    'amount': row[7].strip() if len(row) > 7 else '',
-                    'balance': row[8].strip() if len(row) > 8 else ''
-                }
+                transaction = self.extract_gl_transaction(row, colmap)
 
                 if transaction['date']:
                     current_transactions.append(transaction)
